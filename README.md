@@ -11,8 +11,8 @@ and shuts the node down cleanly.
 Background, reasoning, and the original walkthrough:
 [EtherHam — TechNote: Shutdown an ASL3 Node with Three Key-Ups](https://etherham.com/technote-shutdown-an-asl3-node-with-three-key-ups/)
 
-Tested on a Raspberry Pi Zero 2W running ASL3 on Debian 13 with an AllScan
-UCI90 interface. It should work on any ASL3 node regardless of radio
+Tested on a Raspberry Pi Zero 2W and an x86 Intel Celeron N3450 laptop,
+both running ASL3 on Debian 13 with AllScan UCI90 interfaces. It should work on any ASL3 node regardless of radio
 interface, since it keys off the AMI event stream rather than hardware GPIO
 — see [Troubleshooting](#troubleshooting) below if key-ups aren't being
 recognized on your setup.
@@ -38,33 +38,91 @@ shutdown.
 
 ### 1. Configure AMI access
 
-Edit `/etc/asterisk/manager.conf` and add a dedicated user for this script:
+ASL3 already ships a `manager.conf` with a `[general]` section. **Do not add
+a second one.** First, confirm the existing one has `enabled = yes`:
+
+```bash
+sudo grep -nE '^\[|enabled|bindaddr|port' /etc/asterisk/manager.conf
+```
+
+You should see exactly one `[general]` line with `enabled = yes` under it.
+Leave `[admin]` and any other existing sections alone — Allmon3 and AllScan
+use them.
+
+Then open the file and add **only** this block at the very bottom:
+
+```bash
+sudo nano /etc/asterisk/manager.conf
+```
 
 ```ini
-[general]
-enabled = yes
-port = 5038
-bindaddr = 127.0.0.1
-
 [shutdownmon]
 secret = yourpasswordhere
 read = all
 write = command
 ```
 
-Pick your own secret — don't reuse another AMI user's password. After
-saving, **reboot the node**. A `manager.conf` reload alone has been reported
-to not pick up a new/changed AMI user reliably; a full reboot does.
+Pick your own secret — don't reuse another AMI user's password. Save and
+exit nano (Ctrl+O, Enter, Ctrl+X).
+
+**Reboot the node now — this step is required.** A `manager.conf` reload
+alone has been reported to not pick up a new or changed AMI user reliably;
+a full reboot does. Your SSH session will drop; wait about a minute and
+reconnect.
+
+```bash
+sudo reboot
+```
+
+After reconnecting, confirm Asterisk loaded the new user:
+
+```bash
+sudo asterisk -rx "manager show user shutdownmon"
+```
+
+If it prints details for `shutdownmon`, continue to step 2. If it reports
+the user isn't found, recheck the block you added before going further.
 
 ### 2. Install the script
 
-Copy [`shutdown_monitor.py`](shutdown_monitor.py) to `/usr/local/bin/shutdown_monitor.py`,
-then edit the constants at the top of the file:
+First, confirm `curl` is installed:
+
+```bash
+which curl
+```
+
+If that prints nothing, install it with `sudo apt install -y curl` before
+continuing.
+
+Download the script:
+
+```bash
+sudo curl -fsSL -o /usr/local/bin/shutdown_monitor.py https://raw.githubusercontent.com/EtherHamRadio/asl-shutdown-monitor/main/shutdown_monitor.py
+```
+
+Set ownership and permissions. The service runs as the `asterisk` user, so
+it must be able to read the file; these settings also keep the AMI password
+inside it away from other users:
+
+```bash
+sudo chown root:asterisk /usr/local/bin/shutdown_monitor.py
+sudo chmod 750 /usr/local/bin/shutdown_monitor.py
+```
+
+Edit the constants at the top of the file:
+
+```bash
+sudo nano /usr/local/bin/shutdown_monitor.py
+```
 
 ```python
-AMI_PASS = 'CHANGE_ME'   # must match the secret= line above
+AMI_PASS = 'CHANGE_ME'   # must match the secret= line from step 1
 NODE = '588412'          # your node number
 ```
+
+If your server hosts more than one node (for example, a public node plus a
+private node used by DVSwitch), set `NODE` to the node your **radio
+interface** is attached to. Save and exit nano (Ctrl+O, Enter, Ctrl+X).
 
 `WINDOW_SEC` (default `2.5`) and `REQUIRED` (default `3`) are also
 configurable there — see [Configuration](#configuration) and
@@ -72,49 +130,72 @@ configurable there — see [Configuration](#configuration) and
 
 ### 3. Configure sudo permissions
 
-The script needs passwordless permission to run `shutdown` (and `asterisk
--rx` if you enable the optional voice announcement below):
+The script needs passwordless permission to run `shutdown` and
+`asterisk -rx` (for the "goodbye" announcement). Put the rule in its own
+drop-in file rather than editing the main sudoers file:
 
 ```bash
-sudo visudo
+sudo visudo -f /etc/sudoers.d/shutdown-monitor
 ```
 
-Add:
-
-```
-asterisk ALL=(ALL) NOPASSWD: /sbin/shutdown
-```
-
-Or, if you're using the voice announcement feature too:
+It opens in nano. Add this single line, then save and exit (Ctrl+O, Enter,
+Ctrl+X):
 
 ```
 asterisk ALL=(ALL) NOPASSWD: /sbin/shutdown, /usr/sbin/asterisk
 ```
 
-### 4. Install the systemd service
+If `visudo` reports a syntax error on save, press `e` to go back and fix
+the line — don't press `Q`.
 
-Copy [`shutdown-monitor.service`](shutdown-monitor.service) to
-`/etc/systemd/system/shutdown-monitor.service`, then:
+Confirm the rule took effect:
 
 ```bash
+sudo -l -U asterisk
+```
+
+You should see both commands listed under `NOPASSWD`.
+
+### 4. Test the script by hand
+
+This confirms the password and node number are right before systemd is
+involved. **Key up no more than twice during this test** — three key-ups
+will really shut the node down.
+
+```bash
+sudo -u asterisk python3 /usr/local/bin/shutdown_monitor.py
+```
+
+- **Working:** you see `Connected to AMI`, and each key-up prints
+  `Key-up detected. 1 within 2.5s window.`
+- **Not working:** you see `Connection error… Retrying in 10s`. This
+  almost always means `AMI_PASS` doesn't match the `secret=` line. Note
+  that `Connected to AMI` prints even when the login is rejected, so the
+  retry line is the one to watch for.
+
+Press Ctrl+C to stop the test.
+
+### 5. Install and start the systemd service
+
+```bash
+sudo curl -fsSL -o /etc/systemd/system/shutdown-monitor.service https://raw.githubusercontent.com/EtherHamRadio/asl-shutdown-monitor/main/shutdown-monitor.service
 sudo systemctl daemon-reload
-sudo systemctl enable shutdown-monitor
-sudo systemctl start shutdown-monitor
+sudo systemctl enable --now shutdown-monitor
 sudo systemctl status shutdown-monitor
 ```
 
-Watch it live with:
+### 6. Test it for real
+
+Open the live log:
 
 ```bash
 sudo journalctl -fu shutdown-monitor
 ```
 
-### 5. Test it
-
 Key up three times quickly on the node's local mic. You should see the
-key-up count climb in the journal log, then a shutdown. Confirm the node
-actually reboots/powers down as expected before you rely on this in the
-field.
+key-up count climb in the log, hear "goodbye" (if you've set up the
+announcement), and the node should power down. Confirm it actually shuts
+down before you rely on this in the field.
 
 ## Configuration
 
@@ -154,7 +235,24 @@ all telemetry and local audio playback, including this announcement.
 
 AMI credential mismatch. Double check the `secret=` in `manager.conf`
 matches `AMI_PASS` in the script exactly, and that you rebooted after
-adding the AMI user (see step 1).
+adding the AMI user (see step 1). `sudo asterisk -rx "manager show user
+shutdownmon"` confirms whether Asterisk has loaded the user at all.
+
+Note that the log line `Connected to AMI. Monitoring for key-up events.`
+appears as soon as the TCP connection opens, before Asterisk accepts or
+rejects the login — so seeing it does not mean the password was accepted.
+
+### Service fails with "Permission denied"
+
+The service runs as the `asterisk` user, which must be able to read
+`/usr/local/bin/shutdown_monitor.py`. Re-run the `chown root:asterisk` and
+`chmod 750` commands from step 2.
+
+### Key-ups on the wrong node (multi-node servers)
+
+`NODE` must be the node your radio interface is attached to. Key-ups
+arriving through another node on the same server (e.g. a private node used
+by DVSwitch) are deliberately ignored.
 
 ### Rapid key-ups not being counted
 
@@ -227,8 +325,16 @@ sudo rm /usr/local/bin/shutdown_monitor.py
 sudo systemctl daemon-reload
 ```
 
-Then remove the `asterisk ALL=(ALL) NOPASSWD: ...` line from sudoers
-(`sudo visudo`) and the `[shutdownmon]` block from `manager.conf`.
+Then remove the sudoers rule and the `[shutdownmon]` block from
+`manager.conf`:
+
+```bash
+sudo rm /etc/sudoers.d/shutdown-monitor
+sudo nano /etc/asterisk/manager.conf
+```
+
+(If you added the rule to the main sudoers file under an older version of
+these instructions, remove that line with `sudo visudo` instead.)
 
 ## Safety note
 

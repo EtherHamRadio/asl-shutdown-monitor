@@ -67,7 +67,7 @@ def record_keyup():
     return False
 
 
-def is_unkey_event(block):
+def is_keyup_event(block):
     return (
         'Event: RPT_RXKEYED' in block and
         'EventValue: 1' in block and
@@ -96,7 +96,7 @@ def run():
             buf += chunk
             while '\r\n\r\n' in buf:
                 block, buf = buf.split('\r\n\r\n', 1)
-                if is_unkey_event(block):
+                if is_keyup_event(block):
                     if record_keyup():
                         trigger_shutdown()
         except socket.timeout:
